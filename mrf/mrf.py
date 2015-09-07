@@ -3,13 +3,13 @@ Brandon L. Reiss
 
 mrf - A general Markov Random Field library.
 '''
-import numpy as np
 import itertools as it
-import string
-import operator
-import networkx as nx
 
-def query_table(names, nstates, q, table):
+import networkx as nx
+import numpy as np
+
+
+def _query_table(names, nstates, q, table):
     '''
     Query the potential function defined by the N-dimensional matrix
     table over a full query assignment.
@@ -78,8 +78,10 @@ class Factor(object):
 
     def __init__(self, names, table=None, var=None):
         '''
-        Initialize the factor from different input data. The data are not
-        copied. See fromXxx() static functions.
+        Initialize the factor from different input data.
+        See also fromXxx() static functions.
+
+        N.B. The table data are not copied defensively.
         '''
 
         self._names = list(names)
@@ -103,7 +105,16 @@ class Factor(object):
         return self.query(*args)
 
     def __repr__(self):
-        return 'fac(' + string.join(self.names, ', ') + ')'
+        prefix = 'Factor('
+        base_indent = '\n' + ' ' * len(prefix)
+        table_prop_offset = ' ' * len('table=')
+        table_repr = (base_indent + table_prop_offset).join(
+            repr(self.table).split('\n'))
+        return '{}{})'.format(
+            prefix,
+            (',' + base_indent).join(
+                [repr(self.names),
+                 "table={}".format(table_repr)]))
 
     def contains_var(self, var):
         return var.name in self._names_set
@@ -148,8 +159,29 @@ class Factor(object):
         else:
             return None
 
-    def query(self, q):
-        return query_table(self.names, self.nstates, q, self.table)
+    def query(self, *args):
+        '''
+        Query the factor with the given variable states.
+
+        Note that the query can be individual variable states as in
+            factor(0, 1, ...)
+        or a single tuple of states as in
+            factor((0, 1, ...))
+        of a dictionary of states as in
+            factor({'var1': 0, ...}).
+        '''
+        if len(args) == 0:
+            raise ValueError("Factor query cannot be empty.")
+        elif len(args) == 1:
+            q = args[0]
+            # When the query is a single value, wrap it in an iterable type.
+            try:
+                iter(q)
+            except TypeError:
+                q = (q,)
+        else:
+            q = args
+        return _query_table(self.names, self.nstates, q, self.table)
 
 
 class Network(object):
@@ -161,8 +193,8 @@ class Network(object):
     not exposed by this structure.
     '''
 
-    def __init__(self, factors, alpha=1.0,
-            names_order=None, is_energy_funcs=False):
+    def __init__(self, factors, alpha=None,
+                 names_order=None, is_energy_funcs=False):
 
         # Initialize name order.
         all_names = set(it.chain(*[f.names for f in factors]))
@@ -182,21 +214,37 @@ class Network(object):
                 else:
                     nstates_ordered[idx] = nstates
 
-        # Setup query.
-        if not is_energy_funcs:
-            self.query = self._query_prod
-        else:
-            self.query = self._query_sum
-
         # Gather factor variables.
         self._names = names_order
         self._nstates = nstates_ordered
+        if is_energy_funcs:
+            # When log-linear, partition is a subtraction.
+            if not alpha:
+                alpha = 0.0
+            self._partition = alpha
+        else:
+            # When not log-linear, partition is a scale.
+            if not alpha:
+                alpha = 1.0
+            self._partition = 1.0 / alpha
         self._alpha = alpha
-        self._partition = 1.0 / alpha
         self._factors = factors
+        self._is_energy_funcs = is_energy_funcs
 
     def __repr__(self):
-        return "net: F(" + string.join(self.names, ', ') + ')'
+        prefix = "Network("
+        base_indent = '\n' + ' ' * len(prefix)
+        factor_indent = base_indent + ' '
+        factors_repr = '[{}]'.format(
+            (',' + factor_indent).join(factor_indent.join(
+                repr(fac).split('\n')) for fac in self.factors))
+        return "{}{})".format(
+            prefix,
+            (',' + base_indent).join(
+                [factors_repr,
+                 "names_order={}".format(self.names),
+                 "alpha={}".format(self.alpha),
+                 "is_energy_funcs={}".format(self.is_energy_funcs)]))
 
     def __call__(self, *args):
         return self.query(*args)
@@ -219,17 +267,25 @@ class Network(object):
 
     @property
     def is_energy_funcs(self):
-        return self.query == self._query_sum
+        return self._is_energy_funcs
 
     def partition(self, alpha):
         '''
-        Apply an inverse partitioning constant alpha to the network. The
-        current inverse partitioning constant remains intact so that the
-        network returned has a sum over its joint distribution scaled by
-        (1. / alpha).
+        Apply a partitioning constant alpha to the network. The current
+        partitioning constant remains intact so that the network returned has a
+        sum over its joint distribution scaled by (1. / alpha).
+
+        N. B. For log-linear models, alpha is assumed to be in log space.
         '''
 
-        return Network(self.factors, self.alpha * alpha, self.names)
+        if self.is_energy_funcs:
+            return Network(self.factors, self.alpha + alpha,
+                           names_order=self.names,
+                           is_energy_funcs=self.is_energy_funcs)
+        else:
+            return Network(self.factors, self.alpha * alpha,
+                           names_order=self.names,
+                           is_energy_funcs=self.is_energy_funcs)
 
     def to_energy_funcs(self):
         '''
@@ -237,46 +293,50 @@ class Network(object):
         '''
 
         if self.is_energy_funcs:
-            return Network(self.factors, names_order=self.names)
+            return Network(self.factors,
+                           names_order=self.names, is_energy_funcs=True)
         else:
             energy_funcs = [Factor.fromTable(fac.names, np.log(fac.table))
-                    for fac in self.factors]
+                            for fac in self.factors]
             return Network(energy_funcs,
-                    names_order=self.names, is_energy_funcs=True)
+                           names_order=self.names, is_energy_funcs=True)
 
-    def _query_prod(self, q):
+    def query(self, *args):
         '''
-        Compute a product of factors given the query assignments. See
-        mrf.query_table() for more information.
+        Query the network with the given variable states.
+
+        Note that the query can be individual variable states as in
+            network(0, 1, ...)
+        or a single tuple of states as in
+            network((0, 1, ...))
+        of a dictionary of states as in
+            network({'var1': 0, ...}).
         '''
+        if len(args) == 0:
+            raise ValueError("Network query cannot be empty.")
+        elif len(args) == 1:
+            q = args[0]
+            # When the query is a single value, wrap it in an iterable type.
+            try:
+                iter(q)
+            except TypeError:
+                q = (q,)
+        else:
+            q = args
 
         # Convert query to a map if it is not already. The map form of query()
-        # simplifies extracting assignments for each factor. 
+        # simplifies extracting assignments for each factor.
         if not isinstance(q, dict):
-            q = dict((p for p in it.izip(self.names, q)))
+            q = dict(p for p in it.izip(self.names, q))
 
-        # Return the product of the factors normalized by alpha.
-        return self._partition * reduce(operator.mul,
-                map(lambda fac: fac(q), self.factors))
-
-    def _query_sum(self, q):
-        '''
-        Compute a sum of factors given the query assignments. See
-        mrf.query_table() for more information.
-        '''
-
-        # Convert query to a map if it is not already. The map form of query()
-        # simplifies extracting assignments for each factor. 
-        if not isinstance(q, dict):
-            q = dict((p for p in it.izip(self.names, q)))
-
-        # Return the product of the factors normalized by alpha.
-        return self._partition * reduce(operator.add,
-                map(lambda fac: fac(q), self.factors))
+        if self.is_energy_funcs:
+            return np.sum((fac(q) for fac in self.factors)) - self._partition
+        else:
+            return np.prod([fac(q) for fac in self.factors]) * self._partition
 
 
 def network_to_dag(network):
-    ''' Convert a ve Network to a networkx DiGraph. '''
+    ''' Convert an mrf Network to a networkx DiGraph. '''
 
     edges = [(c,f.names[-1]) for f in network.factors for c in f.names[:-1]]
     g = nx.DiGraph()
@@ -284,91 +344,9 @@ def network_to_dag(network):
     return g
 
 def network_to_mrf(network):
-    ''' Convert a ve Network to a networkx Graph. '''
+    ''' Convert an mrf Network to a networkx Graph. '''
 
     edges = [(c,f.names[-1]) for f in network.factors for c in f.names[:-1]]
     g = nx.Graph()
     g.add_edges_from(edges)
     return g
-
-def moralize_bayesian_network(bn):
-    ''' Moralize a networkx DiGraph representing a Bayesian network. '''
-
-    # Create undirected graph.
-    mrf = bn.to_undirected()
-
-    # Find v-structures (occur on nodes s.t. indegree > 2) to moralize.
-    for n,d in bn.in_degree_iter():
-        if d > 1:
-            # Moralize unmarried parents (same sex couples welcome).
-            for mom,dad in it.combinations(bn.predecessors(n), 2):
-                mrf.add_edge(mom, dad)
-
-    return mrf
-
-def network_to_rooted_tree(network, root):
-    '''
-    Convert an mrf.Network to a rooted tree.
-
-    Parameters
-    ----------
-    network : mrf.Network
-        The network to convert to a rooted tree.
-    root : name
-        Name of the variable to treat as the root.
-    Returns
-    -------
-    tree : networkx.DiGraph
-        Tree for the network rooted at root.
-    '''
-
-    g = nx.Graph((tuple(f.names) for f in network.factors if len(f.names) > 1))
-    return graph_to_rooted_tree(g, root)
-
-def graph_to_rooted_tree(g, root):
-    '''
-    Convert a networkx Graph to a rooted tree.
-
-    Parameters
-    ----------
-    g : networkx.Graph
-        The graph to convert to a rooted tree.
-    root : name
-        Name of the variable to treat as the root.
-    Returns
-    -------
-    tree : networkx.DiGraph
-        Tree for the network rooted at root.
-    '''
-
-    t = nx.DiGraph()
-
-    def graph_to_rooted_tree_helper(r):
-
-        # Get edges from r.
-        e = g.edge[r]
-        for dst in e:
-            if not dst in t.node:
-                t.add_edge(r,dst)
-                graph_to_rooted_tree_helper(dst)
-
-    graph_to_rooted_tree_helper(root)
-
-    return t
-
-def visualize_rooted_tree(t, prog='dot'):
-    '''
-    Visualize tree graph using graphviz dot.
-
-    Parameters
-    ----------
-    t : networkx.DiGraph
-        The tree to visualize.
-    Returns
-    -------
-    None
-    '''
-
-    nx.draw_graphviz(t, prog=prog, font_size=6, node_shape='s',
-            edge_color='gray', node_size=500, node_color='c')
-

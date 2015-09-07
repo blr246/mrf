@@ -105,7 +105,7 @@ def eliminate(network, elim):
         Returns
         -------
         '''
-        
+
         # Closure for psi_vars index.
         def create_get_idx(i): return lambda p: p[i]
 
@@ -223,4 +223,3 @@ def min_fill(g, n):
     current_edges = g.subgraph(clique_nodes).number_of_edges()
     max_edges = (len(clique_nodes) * (len(clique_nodes) - 1)) / 2
     return max_edges - current_edges
-
