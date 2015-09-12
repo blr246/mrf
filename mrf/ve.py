@@ -3,69 +3,116 @@ Brandon L. Reiss
 
 ve - A graphical models variable elimination library.
 '''
-import mrf
-import numpy as np
-import itertools as it
-import operator
+import itertools as its
 import networkx as nx
 
-def condition_eliminate(network, observed, evidence, order):
+import numpy as np
+
+import mrf
+
+
+def _combine_factors(network):
+    ''' Combine factors over identical variables. '''
+
+    vars_to_fac_idx = {}
+    combined_factors = []
+    if network.is_energy_funcs:
+        combine_op = np.add
+    else:
+        combine_op = np.multiply
+    for f in network.factors:
+        key = tuple(sorted(f.names))
+        if key in vars_to_fac_idx:
+            f_combined = combined_factors[vars_to_fac_idx[key]]
+            f_table = f.table
+            # Swap any axes that are not aligned to the combined view.
+            for idx, (var_combined, var) in enumerate(
+                    its.izip(f.names, f_combined.names)):
+                if var_combined != var:
+                    idx_swap = (i for i in xrange(idx, len(f.names))
+                                if f.names[i] == var_combined).next()
+                    f_table = np.swapaxes(f_table, idx, idx_swap)
+            # Combine the tables now that vars are aligned.
+            combine_op(f_combined.table, f_table, f_combined.table)
+        else:
+            idx = len(combined_factors)
+            # Copy the table for the combined factor.
+            combined_factors.append(mrf.Factor.fromTable(f.names,
+                                                         np.copy(f.table)))
+            vars_to_fac_idx[key] = idx
+
+    return mrf.Network(combined_factors,
+                       alpha=network.alpha,
+                       names_order=network.names,
+                       is_energy_funcs=network.is_energy_funcs)
+
+
+def condition_eliminate(network, scope, evidence, order, normalize=False):
     '''
-    Compute a network that answers conditional queries P(observed | evidence).
+    Compute a network that answers conditional queries P(scope | evidence).
 
     Parameters
     ----------
     network : mrf.Network
         Network to condition and eliminate.
-    observed : list of string
+    scope : list of string
         List of variables to query after conditioning on evidence.
     evidence : dict or list
         Set of variables with fixed state used for conditioning.
     order : list of string
         List of variable names in elimination order.
+    normalize : bool
+        Flag indicating whether or not to re-partition the network.
     Returns
     -------
     network_cond_ve : mrf.Network
-        Network resulting from conditioning and elimination.
+        Network resulting from conditioning and elimination. The network will
+        not be a proper distrubution unless normalize=True.
     '''
 
-    # Check for at least one observed, evidence variables.
-    if len(observed) == 0:
-        raise ValueError("Observed set is empty")
-    if len(evidence) == 0:
-        raise ValueError("Evidence set is empty")
-    # Check that evidence and observed are subsets of the network.
-    if not set(observed).issubset(set(network.names)):
+    scope = set(scope)
+    evidence_vars = set(evidence)
+
+    # Check that evidence and scope are subsets of the network.
+    if not scope.issubset(set(network.names)):
         raise ValueError("Observed is not a subset of the network")
-    if not set(evidence).issubset(set(network.names)):
+    if not evidence_vars.issubset(set(network.names)):
         raise ValueError("Evidence is not a subset of the network")
-    # Check that evidence and observed variables are disjoint.
-    if not set(observed).isdisjoint(set(evidence)):
+    # Check that evidence and scope variables are disjoint.
+    if not scope.isdisjoint(evidence_vars):
         raise ValueError(("Observed and evidence must be disjoint; found " +
-            "{} in intersection").format(
-                set(observed).intersection(set(evidence))))
+                          "{} in intersection").format(
+                              scope.intersection(evidence_vars)))
+
+    elim = set(network.names) - scope - evidence_vars
+    elim_ordered = [v for v in order if v in elim]
+    if len(elim) != len(elim_ordered):
+        raise ValueError(
+            "Elimination order missing eliminated variables {}".format(
+                list(elim - set(order))))
 
     # Condition all factors.
-    n_given_e = set([f.given_evidence(evidence) for f in network.factors])
-    n_given_e.remove(None)
-    names_order = [name for name in network.names
-            if name in (set(network.names) - set(evidence))]
-    n_pre_cond = mrf.Network(n_given_e, names_order=names_order)
+    n_given_e = [f.given_evidence(evidence)
+                 for f in network.factors
+                 if not set(f.names).issubset(evidence_vars)]
+    names_order = [name for name in network.names if name not in evidence_vars]
+    n_cond = mrf.Network(n_given_e,
+                         alpha=network.alpha,
+                         names_order=names_order,
+                         is_energy_funcs=network.is_energy_funcs)
 
-    # Perform variable elimination on the set of non-evidence and non-observed
+    # Perform variable elimination on the set of non-evidence and non-scope
     # variables.
-    elim = set(n_pre_cond.names).difference(set(observed))
-    # Apply order to elim set.
-    elim_ordered = [v for v in order if v in elim]
-    n_cond = eliminate(n_pre_cond, elim_ordered)
+    if len(elim_ordered) > 0:
+        n_cond_elim = eliminate(n_cond, elim_ordered)
+    else:
+        n_cond_elim = _combine_factors(n_cond)
 
-    # Compute partition over joint states of observed variables.
-    alpha = 0.
-    for perm in it.product(*[range(n) for n in n_cond.nstates]):
-        alpha += n_cond.query(dict(
-            ((n,s) for n,s in it.izip(n_cond.names, perm))))
+    if normalize:
+        return n_cond_elim.partition()
+    else:
+        return n_cond_elim
 
-    return n_cond.partition(alpha)
 
 def eliminate(network, elim):
     '''
@@ -83,13 +130,10 @@ def eliminate(network, elim):
         Network resulting from elimination.
     '''
 
-    # Get states per variable for permuting over joint states of factors.
-    nstates_per_var = dict(it.izip(network.names, network.nstates))
+    if len(elim) == 0:
+        return network
 
-    # Make a copy of the input network for elimination.
-    network_ve = network.factors
-
-    def slice_lambda_generator(factor, psi_vars, v):
+    def elim_slice_generator(factor, psi_vars, elim_var):
         '''
         Generate a function : permutation -> slice that extracts the slice of
         the factor table relevant to the states of the eliminated variable with
@@ -98,38 +142,48 @@ def eliminate(network, elim):
         ----------
         factor : mrf.Factor
             The mrf.Factor from which to eliminate a variable.
-        psi_vars : list of Variable
+        psi_vars : list of string
             The variables in the full factor.
-        v : Variable
+        elim_var : string
             The Variable to eliminate.
         Returns
         -------
+        Function from an assignment to psi_vars to the relevant slice of the
+        factor over the states of elim_var.
         '''
 
-        # Closure for psi_vars index.
-        def create_get_idx(i): return lambda p: p[i]
+        psi_var_indices = dict((var, idx)
+                               for var, idx in its.izip(psi_vars, its.count()))
 
-        # Iterate over variables of the factor and generate a tuple of lambdas
-        # that take the mapped index in a permutation for the full factor psi.
-        psi_vars_func_map = dict((k, create_get_idx(v))
-                    for k,v in it.izip(psi_vars, it.count()))
-        psi_vars_func_map[v] = lambda p: slice(None)
-        psi_vars_funcs = [psi_vars_func_map[vname] for vname in factor.names]
-        return lambda p: factor.table[[f(p) for f in psi_vars_funcs]]
+        def query_factor(assignment):
+            # Reorder assignment in factor scope replacing elim_var's state with
+            # slice(None) to capture the full dimension.
+            to_factor_scope = [assignment[psi_var_indices[var]]
+                               if var != elim_var else slice(None)
+                               for var in factor.names]
+            return factor.table[to_factor_scope]
+        return query_factor
+
+    is_energy_funcs = network.is_energy_funcs
+    network = network.to_linear_funcs()
+
+    elim = set(elim)
+    nstates_per_var = dict(its.izip(network.names, network.nstates))
+    network_ve = list(network.factors)
 
     # For each elimination variable, perform sum-product elimination.
     alpha = 1.
     for v in elim:
 
         # Locate all factors f containing v in Scope(f).
-        f_contains_v = [f for f in network_ve if f.contains_var_by_name(v)]
+        f_contains_v = [f for f in network_ve if v in f]
         # Remove factors with eliminated variable in scope.
-        network_ve = [f for f in network_ve if not f.contains_var_by_name(v)]
+        network_ve = [f for f in network_ve if v not in f]
 
         # Get full set of variables to accumulate new table into.
-        psi_vars = list(set(it.chain.from_iterable(
-            (f.names for f in f_contains_v))))
-        psi_vars.remove(v)
+        psi_vars_set = set(
+            its.chain.from_iterable((f.names for f in f_contains_v))) - {v}
+        psi_vars = list(var for var in network.names if var in psi_vars_set)
 
         # When the factor is empty, use it as a constant.
         if len(psi_vars) == 0:
@@ -137,28 +191,41 @@ def eliminate(network, elim):
             continue
 
         # Gather slice generators.
-        factor_slice_generators = [slice_lambda_generator(factor, psi_vars, v)
-                for factor in f_contains_v]
+        factor_slice_generators = [elim_slice_generator(factor, psi_vars, v)
+                                   for factor in f_contains_v]
 
         # Create a factor table to sum into.
-        psi_vars_nstates = tuple(
-                [nstates_per_var[vname] for vname in psi_vars])
-        table = np.empty(psi_vars_nstates)
+        psi_nstates = tuple([nstates_per_var[vname] for vname in psi_vars])
+        table = np.ones(psi_nstates)
 
         # For each permutation of the variables in the state, sum the factors
         # sliced to the scope of the eliminated variable.
-        for perm in it.product(*[range(n) for n in psi_vars_nstates]):
-            p = np.sum(reduce(
-                operator.mul, (g(perm) for g in factor_slice_generators)))
-            table[perm] = p
+        def reduce_states(accum, table):
+            return np.multiply(table, accum, accum)
+
+        v_accum = np.empty(nstates_per_var[v])
+        for perm in its.product(*[range(n) for n in psi_nstates]):
+            v_accum[:] = 1.
+            table[perm] = np.sum(
+                reduce(reduce_states,
+                       (v_slice(perm) for v_slice in factor_slice_generators),
+                       v_accum))
 
         # Add new factor.
         network_ve.append(mrf.Factor.fromTable(psi_vars, table))
 
     # Finally, return a Network of the remaining factors.
-    names_order = [name for name in network.names
-            if name in (set(network.names) - set(elim))]
-    return mrf.Network(network_ve, alpha, names_order)
+    names_order = [name for name in network.names if name not in elim]
+    network_ve = mrf.Network(network_ve,
+                             alpha=network.alpha * alpha,
+                             names_order=names_order,
+                             is_energy_funcs=False)
+    network_ve = _combine_factors(network_ve)
+    if is_energy_funcs:
+        return network_ve.to_energy_funcs()
+    else:
+        return network_ve
+
 
 def greedy_ordering(mrf, score_func, with_rand=True):
     '''
@@ -189,31 +256,36 @@ def greedy_ordering(mrf, score_func, with_rand=True):
     # Copy graph for adding edges during ordering.
     g = nx.Graph(mrf)
     induced = nx.Graph(mrf)
+
     # Create score function closed over the graph.
-    f = lambda n: score_func(g, n)
     # Add within interval [0,1) to randomize equal scores.
+    def score(n):
+        return score_func(g, n)
+
     if with_rand:
-        fp = lambda n: f(n) + np.random.uniform()
+        def score_tie(n):
+            return score_func(g, n) + np.random.uniform()
     else:
-        fp = f
+        score_tie = score
 
     order = []
     for i in range(mrf.number_of_nodes()):
         # Sort the removal list based on score function.
-        to_remove.sort(key=fp, reverse=True)
+        to_remove.sort(key=score_tie, reverse=True)
         # Remove the element with the minimum score.
         removed = to_remove.pop()
-        score = f(removed)
+        min_score = score(removed)
         to_remove_set.remove(removed)
-        order.append((removed, score))
+        order.append((removed, min_score))
         # Add fill edges for the removed element.
-        clique_nodes = [removed] + [n for
-                n in g.neighbors(removed) if n in to_remove_set]
-        g.add_edges_from((e for e in it.combinations(clique_nodes, 2)))
-        induced.add_edges_from((e for e in it.combinations(clique_nodes, 2)))
+        clique_nodes = [removed] \
+            + [n for n in g.neighbors(removed) if n in to_remove_set]
+        g.add_edges_from((e for e in its.combinations(clique_nodes, 2)))
+        induced.add_edges_from((e for e in its.combinations(clique_nodes, 2)))
         g.remove_node(removed)
 
-    return order,induced
+    return order, induced
+
 
 def min_fill(g, n):
     ''' Compute fill edges for a node belonging to the given graph. '''

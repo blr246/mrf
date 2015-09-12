@@ -1,4 +1,4 @@
 mrf
 ===
 
-Some tools for training MRFs.
+Some tools for performing inference on MRFs.

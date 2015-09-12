@@ -21,9 +21,10 @@ class TestMrf(unittest.TestCase):
                          [math.e, 1.0]])
         factor = mrf.Factor(variables, data)
 
-        self.assertTrue(factor.contains_var_by_name('0'))
-        self.assertTrue(factor.contains_var_by_name('1'))
-        self.assertFalse(factor.contains_var_by_name('something'))
+        self.assertTrue('0' in factor and factor.contains_var('0'))
+        self.assertTrue('1' in factor and factor.contains_var('1'))
+        self.assertFalse('something' in factor
+                         or factor.contains_var('something'))
         self.assertEqual(variables, factor.names)
         self.assertEqual((3, 2), factor.nstates)
         self.assertTrue(data is factor.table)
@@ -42,6 +43,11 @@ class TestMrf(unittest.TestCase):
         self.assertEqual(1.0, factor.query({'0': 1, '1': 0}))
         self.assertEqual(math.e, factor({'0': 2, '1': 0}))
         self.assertEqual(math.e, factor.query({'0': 2, '1': 0}))
+
+        factor_evid = factor.given_evidence({'0': 0})
+        self.assertEqual(1.0, factor_evid(0))
+        self.assertEqual(math.e, factor_evid(1))
+        self.assertRaises(ValueError, factor.given_evidence, {'0': 0, '1': 0})
 
     def test_network_properties(self):
         """ Test simple network properties. """
@@ -72,20 +78,30 @@ class TestMrf(unittest.TestCase):
 
         # Convert to energy functions and observe that every setting of the
         # network equals 1.0 (and that the linear model's response is math.e).
+        # Also convert to linear from energy and test queries.
         model_energy = model.to_energy_funcs()
         model_energy_again = model_energy.to_energy_funcs()
+        model_energy_linear = model_energy.to_linear_funcs()
+        model_linear_again = model.to_linear_funcs()
         for assignment in its.product(*[range(val) for val in nstates]):
             self.assertEqual(math.e, model(*assignment))
             self.assertEqual(1.0, model_energy(*assignment))
             self.assertEqual(1.0, model_energy_again(*assignment))
+            self.assertEqual(math.e, model_energy_linear(*assignment))
+            self.assertEqual(math.e, model_linear_again(*assignment))
 
             # Also test other query APIs.
-            self.assertEqual(math.e, model.query(*assignment))
-            self.assertEqual(math.e, model(assignment))
-            self.assertEqual(math.e, model.query(assignment))
-            assignment_dict = dict(zip(variables, assignment))
-            self.assertEqual(math.e, model(assignment_dict))
-            self.assertEqual(math.e, model.query(assignment_dict))
+            for test_model, expected in [(model, math.e),
+                                         (model_energy, 1.0),
+                                         (model_energy_again, 1.0),
+                                         (model_energy_linear, math.e),
+                                         (model_linear_again, math.e)]:
+                self.assertEqual(expected, test_model.query(*assignment))
+                self.assertEqual(expected, test_model(assignment))
+                self.assertEqual(expected, test_model.query(assignment))
+                assignment_dict = dict(zip(variables, assignment))
+                self.assertEqual(expected, test_model(assignment_dict))
+                self.assertEqual(expected, test_model.query(assignment_dict))
 
         # Partition the network by doubling alpha.
         model_half = model.partition(2.0)
@@ -102,6 +118,14 @@ class TestMrf(unittest.TestCase):
         model_energy_half_third = model_energy_half.partition(ln_3)
         self.assertEqual(model_energy(0, 0, 0, 0) - (ln_2 + ln_3),
                          model_energy_half_third(0, 0, 0, 0))
+
+        # Partitioning should make network states sum to 1, even when the model
+        # has a non-trivial alpha to begin.
+        model_norm = model.partition(10).partition()
+        z = np.sum([model_norm(x)
+                    for x in its.product(*[range(n)
+                                           for n in model_norm.nstates])])
+        self.assertAlmostEqual(1.0, z)
 
     def _test_nfactor_helper(self, is_energy_funcs, largest_clique, nstates):
         """

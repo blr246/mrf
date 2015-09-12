@@ -41,7 +41,13 @@ def mplp(n, eps=2e-4, max_iter=1e3, momentum=0.):
     if momentum < 0 or momentum >= 1:
         raise ValueError("Must have 0 < momentum <= 1")
 
-    assert(n.is_energy_funcs)
+    if not n.is_energy_funcs:
+        raise ValueError("MPLP only works with log-linear models. "
+                         "See Network.to_energy_funcs().")
+    if max(len(f.names) for f in n.factors) > 2:
+        raise ValueError("MPLP implementation only supports pairwise networks; "
+                         "see research papers to adapt to general MRFs.")
+
     g = mrf.network_to_mrf(n)
 
     name_to_idx_map = dict((p for p in zip(n.names, it.count())))
@@ -52,7 +58,7 @@ def mplp(n, eps=2e-4, max_iter=1e3, momentum=0.):
             single_node_factors, key=lambda f: name_to_idx(f.names[0]))
 
     edge_factors = [fac for fac in n.factors if len(fac.names) == 2]
-    
+
     edges = dict(((name_to_idx(i), [name_to_idx(j) for j in js])
         for i,js in g.edge.iteritems()))
 
@@ -121,7 +127,7 @@ def mplp(n, eps=2e-4, max_iter=1e3, momentum=0.):
             dij_new = -0.5 * di_j(*ji) + 0.5 * np.max(
                     edge.table.T + di_j(*ij), axis=1)
             assert(len(dij_new) == edge.nstates[1])
-            
+
             delta[ji] = (minv * dji_new) + (m * delta[ji])
             delta[ij] = (minv * dij_new) + (m * delta[ij])
 

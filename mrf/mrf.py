@@ -4,6 +4,7 @@ Brandon L. Reiss
 mrf - A general Markov Random Field library.
 '''
 import itertools as it
+import operator
 
 import networkx as nx
 import numpy as np
@@ -104,6 +105,9 @@ class Factor(object):
     def __call__(self, *args):
         return self.query(*args)
 
+    def __contains__(self, name):
+        return name in self._names_set
+
     def __repr__(self):
         prefix = 'Factor('
         base_indent = '\n' + ' ' * len(prefix)
@@ -116,11 +120,8 @@ class Factor(object):
                 [repr(self.names),
                  "table={}".format(table_repr)]))
 
-    def contains_var(self, var):
-        return var.name in self._names_set
-
-    def contains_var_by_name(self, name):
-        return name in self._names_set
+    def contains_var(self, name):
+        return name in self
 
     @property
     def names(self):
@@ -150,14 +151,13 @@ class Factor(object):
             New factor with variables in this scope fixed as per evidence.
         '''
 
-        slicer = map(
-                lambda v: evidence[v] if v in evidence else slice(None),
-                self.names)
-        names = [v for v in self.names if not v in evidence]
+        slicer = [evidence[v] if v in evidence else slice(None)
+                  for v in self.names]
+        names = [v for v in self.names if v not in evidence]
         if len(names) > 0:
             return Factor.fromTable(names, self.table[slicer])
         else:
-            return None
+            raise ValueError("Cannot condition on every variable; use query().")
 
     def query(self, *args):
         '''
@@ -203,11 +203,11 @@ class Network(object):
         assert set(names_order) == all_names
 
         # Get variable states per name.
-        name_to_idx = dict(
-                ((name,idx) for name,idx in it.izip(names_order, it.count())))
+        name_to_idx = dict((name, idx)
+                           for name, idx in it.izip(names_order, it.count()))
         nstates_ordered = [None] * len(names_order)
         for f in factors:
-            for name,nstates in it.izip(f.names, f.nstates):
+            for name, nstates in it.izip(f.names, f.nstates):
                 idx = name_to_idx[name]
                 if nstates_ordered[idx] is not None:
                     assert nstates_ordered[idx] == nstates
@@ -269,21 +269,48 @@ class Network(object):
     def is_energy_funcs(self):
         return self._is_energy_funcs
 
-    def partition(self, alpha):
+    def partition(self, alpha=None):
         '''
         Apply a partitioning constant alpha to the network. The current
         partitioning constant remains intact so that the network returned has a
         sum over its joint distribution scaled by (1. / alpha).
 
         N. B. For log-linear models, alpha is assumed to be in log space.
-        '''
 
-        if self.is_energy_funcs:
-            return Network(self.factors, self.alpha + alpha,
-                           names_order=self.names,
-                           is_energy_funcs=self.is_energy_funcs)
+        When alpha=None, compute the partition overall network states. This can
+        be intractable for large networks.
+        '''
+        if alpha:
+            if self.is_energy_funcs:
+                return Network(self.factors,
+                               alpha=self.alpha + alpha,
+                               names_order=self.names,
+                               is_energy_funcs=self.is_energy_funcs)
+            else:
+                return Network(self.factors,
+                               alpha=self.alpha * alpha,
+                               names_order=self.names,
+                               is_energy_funcs=self.is_energy_funcs)
         else:
-            return Network(self.factors, self.alpha * alpha,
+            state_sets = [range(n) for n in self.nstates]
+            if self.is_energy_funcs:
+                network_no_scale = Network(self.factors,
+                                           alpha=0,
+                                           names_order=self.names,
+                                           is_energy_funcs=self.is_energy_funcs)
+                alpha = np.log(np.sum(np.exp(
+                    [network_no_scale(assignment)
+                     for assignment in it.product(*state_sets)])))
+            else:
+                network_no_scale = Network(self.factors,
+                                           alpha=1,
+                                           names_order=self.names,
+                                           is_energy_funcs=self.is_energy_funcs)
+                alpha = np.sum(
+                    [network_no_scale(assignment)
+                     for assignment in it.product(*state_sets)])
+            return Network(self.factors,
+                           alpha=alpha,
                            names_order=self.names,
                            is_energy_funcs=self.is_energy_funcs)
 
@@ -293,13 +320,27 @@ class Network(object):
         '''
 
         if self.is_energy_funcs:
-            return Network(self.factors,
+            return Network(self.factors, alpha=self.alpha,
                            names_order=self.names, is_energy_funcs=True)
         else:
             energy_funcs = [Factor.fromTable(fac.names, np.log(fac.table))
                             for fac in self.factors]
-            return Network(energy_funcs,
+            return Network(energy_funcs, alpha=np.log(self.alpha),
                            names_order=self.names, is_energy_funcs=True)
+
+    def to_linear_funcs(self):
+        '''
+        Convert potentials to linear functions.
+        '''
+
+        if self.is_energy_funcs:
+            linear_funcs = [Factor.fromTable(fac.names, np.exp(fac.table))
+                            for fac in self.factors]
+            return Network(linear_funcs, alpha=np.exp(self.alpha),
+                           names_order=self.names, is_energy_funcs=False)
+        else:
+            return Network(self.factors, alpha=self.alpha,
+                           names_order=self.names, is_energy_funcs=False)
 
     def query(self, *args):
         '''
@@ -338,15 +379,16 @@ class Network(object):
 def network_to_dag(network):
     ''' Convert an mrf Network to a networkx DiGraph. '''
 
-    edges = [(c,f.names[-1]) for f in network.factors for c in f.names[:-1]]
+    edges = [(c, f.names[-1]) for f in network.factors for c in f.names[:-1]]
     g = nx.DiGraph()
     g.add_edges_from(edges)
     return g
 
+
 def network_to_mrf(network):
     ''' Convert an mrf Network to a networkx Graph. '''
 
-    edges = [(c,f.names[-1]) for f in network.factors for c in f.names[:-1]]
+    edges = [(c, f.names[-1]) for f in network.factors for c in f.names[:-1]]
     g = nx.Graph()
     g.add_edges_from(edges)
     return g
